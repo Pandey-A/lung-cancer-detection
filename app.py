@@ -1,94 +1,88 @@
 import os
 from io import BytesIO
-from typing import List
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+import streamlit as st
 from PIL import Image
 from tensorflow.keras.models import load_model
 
+st.set_page_config(
+    page_title="PulmoScan AI",
+    page_icon="🫁",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
-# Model and preprocessing configuration
 MODEL_PATH = os.environ.get("MODEL_PATH", "trained_lung_cancer_model.h5")
 IMAGE_SIZE = (350, 350)
 
-# Keep class order aligned with training generator class_indices
 DEFAULT_CLASS_LABELS = [
-    "adenocarcinoma_left.lower.lobe_T2_N0_M0_Ib",
-    "large.cell.carcinoma_left.hilum_T2_N2_M0_IIIa",
-    "normal",
-    "squamous.cell.carcinoma_left.hilum_T1_N2_M0_IIIa",
+    "Adenocarcinoma",
+    "Large Cell Carcinoma",
+    "Normal",
+    "Squamous Cell Carcinoma",
 ]
 
 raw_labels = os.environ.get("CLASS_LABELS", "")
-if raw_labels.strip():
-    class_labels: List[str] = [item.strip() for item in raw_labels.split(",") if item.strip()]
-else:
-    class_labels = DEFAULT_CLASS_LABELS
-
-app = FastAPI(title="Lung Cancer Prediction API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-model = None
+class_labels = [item.strip() for item in raw_labels.split(",") if item.strip()] if raw_labels.strip() else DEFAULT_CLASS_LABELS
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    global model
+@st.cache_resource
+def load_trained_model():
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found at: {MODEL_PATH}")
-    model = load_model(MODEL_PATH)
-    print(f"Loaded model from: {MODEL_PATH}")
+        st.error(f"❌ Model file not found at: {MODEL_PATH}")
+        st.stop()
+    return load_model(MODEL_PATH)
 
 
-@app.get("/")
-def health_check():
-    return {
-        "status": "healthy",
-        "model_loaded": model is not None,
-        "model_path": MODEL_PATH,
-        "class_count": len(class_labels),
-    }
+st.title("🫁 PulmoScan AI")
+st.subheader("Lung Cancer Detection using Deep Learning")
+st.write("---")
 
+st.markdown("""
+Upload a CT scan image to get an AI-powered prediction of lung cancer classification.
+""")
 
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
+model = load_trained_model()
 
-    try:
-        content = await file.read()
-        pil_img = Image.open(BytesIO(content)).convert("RGB")
-        pil_img = pil_img.resize(IMAGE_SIZE)
+uploaded_file = st.file_uploader("📁 Choose a CT scan image", type=["png", "jpg", "jpeg"])
 
-        img_arr = np.array(pil_img, dtype=np.float32) / 255.0
-        img_arr = np.expand_dims(img_arr, axis=0)
+if uploaded_file is not None:
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Uploaded Image")
+        image = Image.open(uploaded_file).convert("RGB")
+        st.image(image, use_column_width=True)
+    
+    with col2:
+        st.subheader("Analysis")
+        
+        image_resized = image.resize(IMAGE_SIZE)
+        img_array = np.array(image_resized, dtype=np.float32) / 255.0
+        img_array = np.expand_dims(img_array, axis=0)
+        
+        predictions = model.predict(img_array, verbose=0)
+        pred_index = int(np.argmax(predictions[0]))
+        confidence = float(np.max(predictions[0]))
+        predicted_label = class_labels[pred_index] if pred_index < len(class_labels) else str(pred_index)
+        
+        color = "🟢" if predicted_label == "Normal" else "🔴"
+        st.markdown(f"### {color} {predicted_label}")
+        st.metric("Confidence", f"{confidence * 100:.2f}%")
+        
+        st.write("---")
+        st.subheader("All Class Probabilities")
+        
+        for i, label in enumerate(class_labels):
+            prob = float(predictions[0][i])
+            st.write(f"**{label}**: {prob * 100:.2f}%")
+            st.progress(prob)
 
-        preds = model.predict(img_arr)
-        pred_index = int(np.argmax(preds[0]))
-        confidence = float(np.max(preds[0]))
+st.write("---")
+st.markdown("""
+### ⚠️ Medical Disclaimer
+This AI analysis is for screening purposes only and **should not be used as a final diagnosis**. 
+Always consult with a qualified healthcare professional for medical advice and diagnosis.
+""")
 
-        if pred_index >= len(class_labels):
-            predicted_label = str(pred_index)
-        else:
-            predicted_label = class_labels[pred_index]
-
-        return {
-            "filename": file.filename,
-            "prediction": predicted_label,
-            "confidence": confidence,
-            "probabilities": {
-                class_labels[i] if i < len(class_labels) else str(i): float(preds[0][i])
-                for i in range(preds.shape[1])
-            },
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
